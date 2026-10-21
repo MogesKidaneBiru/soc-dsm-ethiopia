@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+env/
+
+# Data (not shared; see data/README.md)
+data/*
+!data/README.md
+!data/example_input.csv
+
+# Outputs and large files
+outputs/*
+!outputs/.gitkeep
+*.tif
+*.tiff
+*.pkl
+*.joblib
+*.cbm
+
+# System
+.DS_Store
+Thumbs.db

@@ -5,6 +5,7 @@ from pathlib import Path
 
 # Configuration
 CONFIG = {
+    "strict_reproduction": True,
     "analysis_table": "data/analysis_table.csv",
     "seed59_blocks_json": "data/seed59.json",
     "product_points": "data/products_at_points.csv",
@@ -98,7 +99,18 @@ CONFIG = {
     "threads": 8,
     "early_stopping": 50,
     "weight_alpha": 0.5,
-    "models": ["mean", "ok", "ridge_flowacc_log", "rf", "xgb", "cb", "cbqw"],
+    "models": [
+        "mean",
+        "ok",
+        "ridge_flowacc_log",
+        "rf",
+        "xgb",
+        "cb",
+        "cbqw",
+        "cbqw_xy",
+        "cbqw_ohe",
+        "cbqw_rk",
+    ],
     "trials": {"ridge": 40, "rf": 50, "xgb": 80, "cb": 80},
     "search_spaces": {
         "ridge": {"alpha": {"type": "float", "low": 0.001, "high": 100.0, "log": True}},
@@ -153,7 +165,13 @@ CONFIG = {
         "distance_workers": 8,
         "iqr_multiplier": 1.5,
     },
-    "bootstrap": {"seed": 20261016, "replicates": 2000, "chunk": 50},
+    "bootstrap": {
+        "seed": 20261016,
+        "replicates": 2000,
+        "chunk": 50,
+        "zone_seed": 42,
+        "zone_min_n": 30,
+    },
     "mapping": {
         "tile_size": 256,
         "nn_batch": 512,
@@ -189,7 +207,7 @@ from scipy.spatial import cKDTree
 from scipy.stats import rankdata
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import GroupKFold, KFold, train_test_split
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from threadpoolctl import threadpool_limits
 from xgboost import XGBRegressor
@@ -363,7 +381,7 @@ def load_analysis_table():
         data.y_proj / block_m
     ).astype("int64")
     if "block_id" in data and not np.array_equal(data.block_id, blocks):
-        raise ValueError("Block IDs do not match the notebook's 75-km grid.")
+        raise ValueError("Block IDs do not match the configured 75-km grid.")
     data["block_id"] = blocks
     allocation_path = relative_path(CONFIG["seed59_blocks_json"])
     if allocation_path.is_file():
@@ -390,11 +408,15 @@ def load_analysis_table():
         "working": int((~holdout_mask).sum()),
         "holdout": int(holdout_mask.sum()),
     }
-    if counts != CONFIG["expected_n"]:
+    if CONFIG["strict_reproduction"] and counts != CONFIG["expected_n"]:
         raise ValueError(f"The final analysis cohort differs: {counts}")
-    for role, selected in [("working", ~holdout_mask), ("holdout", holdout_mask)]:
-        if data.loc[selected, "block_id"].nunique() != CONFIG["expected_blocks"][role]:
-            raise ValueError("Unexpected block count for " + role)
+    if CONFIG["strict_reproduction"]:
+        for role, selected in [("working", ~holdout_mask), ("holdout", holdout_mask)]:
+            if (
+                data.loc[selected, "block_id"].nunique()
+                != CONFIG["expected_blocks"][role]
+            ):
+                raise ValueError("Unexpected block count for " + role)
     total = data.AEZ_name.value_counts()
     held = (
         data.loc[holdout_mask, "AEZ_name"]
@@ -415,7 +437,7 @@ def load_analysis_table():
         or abs(holdout_mask.mean() - CONFIG["holdout_fraction"])
         > CONFIG["holdout_fraction_tolerance"]
     ):
-        raise ValueError("The frozen holdout fails the notebook's split criteria.")
+        raise ValueError("The frozen holdout fails the configured split criteria.")
     composition = pd.DataFrame(
         dict(
             zone=total.index,
@@ -564,7 +586,7 @@ def spatial_design(data, output):
     sizes = (
         work.groupby("cv_fold").size().reindex(range(CONFIG["n_folds"]), fill_value=0)
     )
-    if sizes.tolist() != CONFIG["expected_fold_n"]:
+    if CONFIG["strict_reproduction"] and sizes.tolist() != CONFIG["expected_fold_n"]:
         raise ValueError(
             "Fold sizes differ from the frozen manuscript folds: " + str(sizes.tolist())
         )
@@ -617,7 +639,7 @@ def category_tokens(frame):
     return values.astype("int64").astype(str)
 
 
-def fit_preprocessor(training, ridge=False):
+def fit_preprocessor(training, ridge=False, add_xy=False):
     cont, cat = CONFIG["continuous"], CONFIG["categorical"]
     prep = dict(
         continuous=cont,
@@ -631,6 +653,8 @@ def fit_preprocessor(training, ridge=False):
         prep["flowacc_scaler"] = StandardScaler().fit(
             np.log1p(training[["r_flowacc"]].to_numpy(float))
         )
+    if add_xy:
+        prep["xy_scaler"] = StandardScaler().fit(training[["x_proj", "y_proj"]])
     return prep
 
 
@@ -649,6 +673,8 @@ def transform_frame(frame, prep, native):
     X = pd.DataFrame(continuous, columns=cont)
     for j, name in enumerate(cat):
         X[name] = categories[:, j]
+    if "xy_scaler" in prep:
+        X[["n_x", "n_y"]] = prep["xy_scaler"].transform(frame[["x_proj", "y_proj"]])
     return X
 
 
@@ -704,11 +730,15 @@ def fit_estimator(
     if weights is not None:
         arguments["sample_weight"] = weights
     if kind == "cb":
-        arguments["cat_features"] = list(
-            range(
-                len(CONFIG["continuous"]),
-                len(CONFIG["continuous"]) + len(CONFIG["categorical"]),
+        arguments["cat_features"] = (
+            list(
+                range(
+                    len(CONFIG["continuous"]),
+                    len(CONFIG["continuous"]) + len(CONFIG["categorical"]),
+                )
             )
+            if isinstance(X, pd.DataFrame)
+            else []
         )
         if evaluate is not None:
             arguments.update(
@@ -724,8 +754,8 @@ def fit_estimator(
 
 def tune_model(alias, fold, training, validation, folder):
     kind = learner_kind(alias)
-    native = kind == "cb"
-    prep = fit_preprocessor(training, ridge=kind == "ridge")
+    native = kind == "cb" and alias != "cbqw_ohe"
+    prep = fit_preprocessor(training, ridge=kind == "ridge", add_xy=alias == "cbqw_xy")
     X, V = (
         transform_frame(training, prep, native),
         transform_frame(validation, prep, native),
@@ -959,6 +989,107 @@ def krige(xy, z, query, parameters, cfg):
     )
 
 
+def cross_fitted_residuals(training, parameters, folder):
+    residual = np.full(len(training), np.nan)
+    splitter = GroupKFold(3)
+    for j, (a, b) in enumerate(splitter.split(training, groups=training.block_id)):
+        fit = training.iloc[a].reset_index(drop=True)
+        evaluate = training.iloc[b].reset_index(drop=True)
+        prep = fit_preprocessor(fit)
+        X, V = transform_frame(fit, prep, True), transform_frame(evaluate, prep, True)
+        model = estimator("cb", parameters)
+        fit_estimator(model, "cb", X, np.log1p(fit.OC.to_numpy()), rank_weights(fit.OC))
+        residual[b] = np.log1p(evaluate.OC.to_numpy()) - model.predict(V)
+        part = folder / f"crossfit_{j}"
+        save_model(model, "cb", part)
+        save_pickle(part / "preprocessor.pkl", prep)
+        save_csv(
+            part / "residuals.csv",
+            pd.DataFrame(
+                dict(_source_row=evaluate._source_row, residual_log=residual[b])
+            ),
+        )
+        del model, X, V
+        gc.collect()
+    if not np.isfinite(residual).all():
+        raise RuntimeError("Incomplete blocked cross-fitted residuals.")
+    return residual
+
+
+def residual_kriging_correction(training, evaluate, parameters, folder, seed):
+    residual = cross_fitted_residuals(training, parameters, folder)
+    xy = training[["x_proj", "y_proj"]].to_numpy() / 1000
+    fitted, empirical, flags = fit_variogram(xy, residual, CONFIG["kriging"], seed)
+    correction, variance, solve = krige(
+        xy,
+        residual,
+        evaluate[["x_proj", "y_proj"]].to_numpy() / 1000,
+        fitted,
+        CONFIG["kriging"],
+    )
+    save_csv(folder / "variogram.csv", empirical)
+    save_json(
+        folder / "kriging.json",
+        dict(
+            base_model="cbqw",
+            parameters=fitted,
+            flags=flags,
+            solve=solve,
+            crossfit_blocks=3,
+            variogram_seed=seed,
+            residual_definition="Blocked cross-fitted log1p(SOC) residuals; training-only QW fits",
+        ),
+    )
+    save_pickle(
+        folder / "model.pkl",
+        dict(
+            base_model="cbqw",
+            xy_km=xy,
+            residual_log=residual,
+            parameters=fitted,
+        ),
+    )
+    return correction
+
+
+def fit_cv_residual_kriging(work, contexts, base, output):
+    alias = "cbqw_rk"
+    pieces, records = [], []
+    indexed = base["predictions"].set_index("_source_row")
+    for fold in range(CONFIG["n_folds"]):
+        a, b = contexts[fold]["outer"]
+        training, evaluate = (
+            work.iloc[a].reset_index(drop=True),
+            work.iloc[b].reset_index(drop=True),
+        )
+        folder = output / "models" / alias / f"f{fold}"
+        parameters = base["parameters"][fold]
+        correction = residual_kriging_correction(
+            training, evaluate, parameters, folder, 51 + fold
+        )
+        log_prediction = (
+            indexed.loc[evaluate._source_row, "log_prediction"].to_numpy() + correction
+        )
+        prediction = inverse(log_prediction)
+        frame = evaluate[["_source_row", "block_id", "AEZ", "AEZ_name", "OC"]].copy()
+        frame["fold"] = fold
+        frame["log_prediction"], frame["prediction"] = log_prediction, prediction
+        save_csv(folder / "predictions.csv", frame)
+        save_json(
+            folder / "best_params.json",
+            dict(params=parameters, source="cbqw; no new search"),
+        )
+        pieces.append(frame)
+        records.append(dict(alias=alias, fold=fold, **metrics(evaluate.OC, prediction)))
+        print(f"{alias}, fold {fold}: R2={records[-1]['r2']:.6f}", flush=True)
+    predictions = pd.concat(pieces, ignore_index=True).set_index(
+        "_source_row", drop=False
+    )
+    predictions = predictions.loc[work._source_row].reset_index(drop=True)
+    save_csv(output / "predictions" / f"{alias}_OOF.csv", predictions)
+    return dict(parameters={}, predictions=predictions, metrics=records)
+
+
 def fit_cv_alias(work, contexts, alias, output):
     kind = learner_kind(alias)
     parameters, pieces, records = {}, [], []
@@ -1002,10 +1133,13 @@ def fit_cv_alias(work, contexts, alias, output):
                 work.iloc[b].reset_index(drop=True),
                 folder,
             )
-            prep = fit_preprocessor(training, ridge=kind == "ridge")
+            prep = fit_preprocessor(
+                training, ridge=kind == "ridge", add_xy=alias == "cbqw_xy"
+            )
+            native = kind == "cb" and alias != "cbqw_ohe"
             X, V = (
-                transform_frame(training, prep, kind == "cb"),
-                transform_frame(evaluate, prep, kind == "cb"),
+                transform_frame(training, prep, native),
+                transform_frame(evaluate, prep, native),
             )
             model = estimator(kind, parameters[fold])
             fit_estimator(
@@ -1056,9 +1190,13 @@ def summarize_cv(results, output):
 
 
 def nested_spatial_cv(work, contexts, output):
-    results = {
-        alias: fit_cv_alias(work, contexts, alias, output) for alias in CONFIG["models"]
-    }
+    results = {}
+    for alias in CONFIG["models"]:
+        results[alias] = (
+            fit_cv_residual_kriging(work, contexts, results["cbqw"], output)
+            if alias == "cbqw_rk"
+            else fit_cv_alias(work, contexts, alias, output)
+        )
     summarize_cv(results, output)
     return results
 
@@ -1107,6 +1245,8 @@ def final_refit(work, holdout, cv_results, output):
         for alias, result in cv_results.items()
         if result["parameters"]
     }
+    if "cbqw_rk" in CONFIG["models"]:
+        parameters["cbqw_rk"] = parameters["cbqw"].copy()
     save_json(
         output / "frozen_parameters.json",
         dict(
@@ -1117,7 +1257,7 @@ def final_refit(work, holdout, cv_results, output):
         ),
     )
     joined = holdout[["_source_row", "block_id", "AEZ", "AEZ_name", "OC"]].copy()
-    point_model, point_prep = None, None
+    point_model, point_prep, point_log_prediction = None, None, None
     for alias in CONFIG["models"]:
         kind = learner_kind(alias)
         folder = output / "models" / alias
@@ -1149,11 +1289,20 @@ def final_refit(work, holdout, cv_results, output):
                 folder / "model.pkl",
                 dict(xy_km=xy, log_target=target, parameters=fitted),
             )
+        elif alias == "cbqw_rk":
+            correction = residual_kriging_correction(
+                work, holdout, parameters["cbqw"], folder, CONFIG["model_seed"] + 15
+            )
+            log_prediction = point_log_prediction + correction
+            prediction = inverse(log_prediction)
         else:
-            prep = fit_preprocessor(work, ridge=kind == "ridge")
+            prep = fit_preprocessor(
+                work, ridge=kind == "ridge", add_xy=alias == "cbqw_xy"
+            )
+            native = kind == "cb" and alias != "cbqw_ohe"
             X, V = (
-                transform_frame(work, prep, kind == "cb"),
-                transform_frame(holdout, prep, kind == "cb"),
+                transform_frame(work, prep, native),
+                transform_frame(holdout, prep, native),
             )
             model = estimator(kind, parameters[alias])
             fit_estimator(
@@ -1161,7 +1310,7 @@ def final_refit(work, holdout, cv_results, output):
                 kind,
                 X,
                 np.log1p(work.OC.to_numpy()),
-                rank_weights(work.OC) if alias == "cbqw" else None,
+                rank_weights(work.OC) if alias.startswith("cbqw") else None,
             )
             log_prediction = np.asarray(model.predict(V), float)
             prediction = inverse(log_prediction)
@@ -1169,6 +1318,7 @@ def final_refit(work, holdout, cv_results, output):
             save_pickle(folder / "preprocessor.pkl", prep)
             if alias == "cbqw":
                 point_model, point_prep = model, prep
+                point_log_prediction = log_prediction.copy()
             else:
                 del model
             del X, V
@@ -1208,13 +1358,16 @@ def final_refit(work, holdout, cv_results, output):
     return dict(
         model=point_model,
         preprocessor=point_prep,
+        log_prediction=point_log_prediction,
         parameters=parameters,
         predictions=joined,
     )
 
 
-# 5. Quantile models and signed CQR
+# 5. Signed CQR and symmetric residual comparisons
 METHODS = CONFIG["calibration"]["methods"]
+SYMMETRIC_METHODS = ["symmetric_marginal", "symmetric_AEZ"]
+INTERVAL_METHODS = METHODS + SYMMETRIC_METHODS
 LEVELS = CONFIG["calibration"]["levels"]
 MIN_N = CONFIG["calibration"]["minimum_group_n"]
 RELATIVE_SCORE_LIMIT = CONFIG["calibration"]["relative_score_limit"]
@@ -1299,9 +1452,9 @@ def bins(values, edges):
 def group_keys(method, aez, predicted_bin):
     aez = np.asarray(aez, int)
     predicted_bin = np.asarray(predicted_bin, int)
-    if method == METHODS[0]:
+    if method in [METHODS[0], "symmetric_marginal"]:
         return np.full(len(aez), "national", dtype=object)
-    if method == METHODS[1]:
+    if method in [METHODS[1], "symmetric_AEZ"]:
         return np.array(["AEZ:" + str(x) for x in aez], dtype=object)
     if method == METHODS[2]:
         return np.array(["Q:" + str(x) for x in predicted_bin], dtype=object)
@@ -1317,9 +1470,9 @@ def calibrator(scores, aez, point, method, level, edges, land):
     national, rank = conformal_quantile(scores, level)
     predicted = bins(point, edges)
     keys = group_keys(method, aez, predicted)
-    if method == METHODS[0]:
+    if method in [METHODS[0], "symmetric_marginal"]:
         universe = ["national"]
-    elif method == METHODS[1]:
+    elif method in [METHODS[1], "symmetric_AEZ"]:
         universe = ["AEZ:" + str(int(z)) for z in land.VALUE]
     elif method == METHODS[2]:
         universe = ["Q:" + str(q) for q in range(1, len(edges) + 2)]
@@ -1341,7 +1494,7 @@ def calibrator(scores, aez, point, method, level, edges, land):
             used_rank=rank,
         )
     ]
-    if method != METHODS[0]:
+    if method not in [METHODS[0], "symmetric_marginal"]:
         for key in universe:
             mask = keys == key
             count = int(mask.sum())
@@ -1385,31 +1538,38 @@ def apply_corrections(table, method, level, aez, point, edges):
     return np.array(correction), np.array(fallback), np.array(calibration_n)
 
 
-def assessed_bounds(frame, tables, edges, raw_style):
-    shape = (len(METHODS), len(LEVELS), len(frame))
+def assessed_bounds(frame, tables, edges, raw_style, methods=None):
+    methods = METHODS if methods is None else methods
+    shape = (len(methods), len(LEVELS), len(frame))
     lo = np.empty(shape)
     hi = np.empty(shape)
     correction = np.empty(shape)
     fallback = np.empty(shape, bool)
     counts = np.empty(shape, int)
     nesting = []
-    for mi, method in enumerate(METHODS):
+    for mi, method in enumerate(methods):
         original = {}
         for li, level in enumerate(LEVELS):
             c, f, n = apply_corrections(
                 tables, method, level, frame.AEZ, frame.point_prediction, edges
             )
-            if raw_style == "working":
-                rawlo, rawhi = frame[f"raw_lower_{level}"], frame[f"raw_upper_{level}"]
+            if method in SYMMETRIC_METHODS:
+                a, b = frame.point_log.to_numpy() - c, frame.point_log.to_numpy() + c
             else:
-                rawlo, rawhi = (
-                    frame[f"raw_lower_log_{level}"],
-                    frame[f"raw_upper_log_{level}"],
+                if raw_style == "working":
+                    rawlo, rawhi = (
+                        frame[f"raw_lower_{level}"],
+                        frame[f"raw_upper_{level}"],
+                    )
+                else:
+                    rawlo, rawhi = (
+                        frame[f"raw_lower_log_{level}"],
+                        frame[f"raw_upper_log_{level}"],
+                    )
+                a, b = (
+                    np.minimum(rawlo, rawhi).to_numpy() - c,
+                    np.maximum(rawlo, rawhi).to_numpy() + c,
                 )
-            a, b = (
-                np.minimum(rawlo, rawhi).to_numpy() - c,
-                np.maximum(rawlo, rawhi).to_numpy() + c,
-            )
             lo[mi, li], hi[mi, li] = a, b
             correction[mi, li], fallback[mi, li], counts[mi, li] = c, f, n
             original[level] = interval_arrays(
@@ -1507,7 +1667,8 @@ def select_method(table):
     return str(chosen), result
 
 
-def calibration_comparison(frame, bounds, predicted_edges, land, section):
+def calibration_comparison(frame, bounds, predicted_edges, land, section, methods=None):
+    methods = METHODS if methods is None else methods
     predicted = bins(frame.point_prediction, predicted_edges)
     observed = (
         np.ones(len(frame), int)
@@ -1528,7 +1689,7 @@ def calibration_comparison(frame, bounds, predicted_edges, land, section):
         for zone in land.itertuples()
     ]
     rows = []
-    for mi, method in enumerate(METHODS):
+    for mi, method in enumerate(methods):
         for li, level in enumerate(LEVELS):
             arrays = interval_arrays(
                 frame.OC,
@@ -1556,11 +1717,16 @@ def calibration_comparison(frame, bounds, predicted_edges, land, section):
     return pd.DataFrame(rows)
 
 
-def calibration_tables(frame, edges, land):
+def calibration_tables(frame, edges, land, methods=None):
+    methods = METHODS if methods is None else methods
     return pd.concat(
         [
             calibrator(
-                frame[f"CQR_score_{level}"].to_numpy(),
+                frame[
+                    "symmetric_score"
+                    if method in SYMMETRIC_METHODS
+                    else f"CQR_score_{level}"
+                ].to_numpy(),
                 frame.AEZ,
                 frame.point_prediction,
                 method,
@@ -1568,7 +1734,7 @@ def calibration_tables(frame, edges, land):
                 edges,
                 land,
             )
-            for method in METHODS
+            for method in methods
             for level in LEVELS
         ],
         ignore_index=True,
@@ -1595,9 +1761,10 @@ def fit_quantile(training, evaluate, parameters, tau, prep, output, name):
     return model, prediction
 
 
-def interval_prediction_table(frame, bounds):
+def interval_prediction_table(frame, bounds, methods=None):
+    methods = METHODS if methods is None else methods
     rows = []
-    for mi, method in enumerate(METHODS):
+    for mi, method in enumerate(methods):
         for li, level in enumerate(LEVELS):
             arrays = interval_arrays(
                 frame.OC,
@@ -1631,8 +1798,12 @@ def quantiles_and_calibration(work, holdout, contexts, cv_results, final, output
     ].copy()
     working["point_log"] = cv_results["cbqw"]["predictions"].log_prediction.to_numpy()
     working["point_prediction"] = inverse(working.point_log)
+    working["symmetric_score"] = np.abs(
+        np.log1p(working.OC.to_numpy()) - working.point_log.to_numpy()
+    )
     evaluation = holdout[["_source_row", "block_id", "AEZ", "AEZ_name", "OC"]].copy()
     evaluation["point_prediction"] = final["predictions"].cbqw.to_numpy()
+    evaluation["point_log"] = final["log_prediction"]
     land = pd.DataFrame(
         [(code, name) for code, name in CONFIG["aez_legend"].items() if name != "WB"],
         columns=["VALUE", "MAEZ"],
@@ -1669,7 +1840,7 @@ def quantiles_and_calibration(work, holdout, contexts, cv_results, final, output
         )
     save_csv(output / "working_quantile_predictions.csv", working)
     edges = quintile_edges(working.point_prediction)
-    shape = len(METHODS), len(LEVELS), len(working)
+    shape = len(INTERVAL_METHODS), len(LEVELS), len(working)
     lower_log, upper_log = np.empty(shape), np.empty(shape)
     fallback = np.empty(shape, bool)
     fold_corrections, fold_edges, working_nesting = [], {}, []
@@ -1678,9 +1849,11 @@ def quantiles_and_calibration(work, holdout, contexts, cv_results, final, output
         assessment = working.loc[mask].reset_index(drop=True)
         calibration = working.loc[~mask].reset_index(drop=True)
         fold_edges[str(fold)] = quintile_edges(calibration.point_prediction)
-        table = calibration_tables(calibration, fold_edges[str(fold)], land)
+        table = calibration_tables(
+            calibration, fold_edges[str(fold)], land, INTERVAL_METHODS
+        )
         bounds, nesting = assessed_bounds(
-            assessment, table, fold_edges[str(fold)], "working"
+            assessment, table, fold_edges[str(fold)], "working", INTERVAL_METHODS
         )
         lower_log[:, :, mask] = bounds["lower_log"]
         upper_log[:, :, mask] = bounds["upper_log"]
@@ -1691,10 +1864,12 @@ def quantiles_and_calibration(work, holdout, contexts, cv_results, final, output
         lower_log=lower_log, upper_log=upper_log, national_fallback=fallback
     )
     working_comparison = calibration_comparison(
-        working, working_bounds, edges, land, SECTION_A
+        working, working_bounds, edges, land, SECTION_A, INTERVAL_METHODS
     )
-    chosen, selection = select_method(working_comparison)
-    table = calibration_tables(working, edges, land)
+    chosen, selection = select_method(
+        working_comparison.loc[working_comparison.method.isin(METHODS)]
+    )
+    table = calibration_tables(working, edges, land, INTERVAL_METHODS)
     policy = dict(
         method=chosen,
         predicted_edges=edges,
@@ -1704,12 +1879,14 @@ def quantiles_and_calibration(work, holdout, contexts, cv_results, final, output
         nesting_95=CONFIG["calibration"]["nest_95"],
         choice_basis="Working OOF only; existing holdout is a post-hoc check.",
         selection="Best worst-group coverage; mean two-level interval score <=1.05 times best.",
-        post_inspection_method_development=True,
+        nesting_95_added_after_holdout_inspection=True,
+        selection_candidates=METHODS,
+        comparison_only=SYMMETRIC_METHODS,
         exact_conformal_guarantee=False,
     )
-    save_json(output / "phase8_calibration_choice.json", policy)
+    save_json(output / "calibration_choice.json", policy)
     save_json(
-        output / "phase8_interval_policy.json",
+        output / "interval_policy.json",
         dict(
             nest_95=True,
             rule="lower95=min(lower90,lower95); upper95=max(upper90,upper95)",
@@ -1725,7 +1902,7 @@ def quantiles_and_calibration(work, holdout, contexts, cv_results, final, output
     save_csv(output / "working_interval_metrics.csv", working_comparison)
     save_csv(
         output / "working_intervals.csv",
-        interval_prediction_table(working, working_bounds),
+        interval_prediction_table(working, working_bounds, INTERVAL_METHODS),
     )
     print("Working-only calibration choice:", chosen, flush=True)
     models, raw_holdout = {}, {}
@@ -1745,17 +1922,17 @@ def quantiles_and_calibration(work, holdout, contexts, cv_results, final, output
         evaluation[f"raw_upper_log_{level}"] = raw_holdout[b]
         evaluation[f"raw_crossing_{level}"] = raw_holdout[a] > raw_holdout[b]
     evaluated_bounds, holdout_nesting = assessed_bounds(
-        evaluation, table, edges, "holdout"
+        evaluation, table, edges, "holdout", INTERVAL_METHODS
     )
     holdout_comparison = calibration_comparison(
-        evaluation, evaluated_bounds, edges, land, SECTION_B
+        evaluation, evaluated_bounds, edges, land, SECTION_B, INTERVAL_METHODS
     )
     save_csv(output / "holdout_quantile_predictions.csv", evaluation)
     save_csv(output / "holdout_interval_metrics.csv", holdout_comparison)
     save_csv(output / "holdout_nesting_diagnostics.csv", pd.DataFrame(holdout_nesting))
     save_csv(
         output / "holdout_intervals.csv",
-        interval_prediction_table(evaluation, evaluated_bounds),
+        interval_prediction_table(evaluation, evaluated_bounds, INTERVAL_METHODS),
     )
     print(
         holdout_comparison.loc[holdout_comparison.scope.eq("overall")]
@@ -2195,7 +2372,7 @@ def validate_raster_grid():
             if name != "domain" and source.count != 1:
                 raise ValueError("Expected a single-band raster: " + name)
     if grid["transform"].b != 0 or grid["transform"].d != 0:
-        raise ValueError("Rotated grids are not supported by the notebook.")
+        raise ValueError("Rotated raster grids are not supported.")
     return grid, paths
 
 
@@ -2245,13 +2422,23 @@ def read_raster_tile(handles, window):
         )
     if not np.array_equal(valid, complete):
         raise ValueError(
-            "Prepared mapping validity differs from the notebook rule at " + str(window)
+            "Prepared mapping validity differs from the configured rule at "
+            + str(window)
         )
     frame = pd.DataFrame({name: columns[name][valid] for name in features})
     return frame, valid, columns["AEZ"][valid]
 
 
 def national_mapping(final, calibration, aoa, output):
+    missing = [
+        str(path) for path in raster_input_paths().values() if not path.is_file()
+    ]
+    if missing:
+        print(
+            "Mapping skipped; missing raster inputs:\n  " + "\n  ".join(missing),
+            flush=True,
+        )
+        return
     grid, paths = validate_raster_grid()
     output.mkdir(parents=True, exist_ok=True)
     interval_names = [
@@ -2279,7 +2466,7 @@ def national_mapping(final, calibration, aoa, output):
     elif settings["backend"] == "ckdtree":
         engine = TreeSearch(aoa["reference"], workers=CONFIG["threads"])
     else:
-        raise ValueError("Use the notebook's exact blas or ckdtree backend.")
+        raise ValueError("Use the configured exact blas or ckdtree backend.")
     thresholds = np.array(
         [aoa["thresholds"][method]["threshold"] for method in ["fold", "loo"]]
     )
@@ -2515,7 +2702,84 @@ def product_bootstrap(frame, output):
     )
 
 
+def zone_product_bootstrap(frame, output):
+    settings = CONFIG["bootstrap"]
+    names = ["r2", "rmse", "mae", "bias", "ccc", "spearman"]
+    products = ["SoilGrids", "iSDA", "SoilGrids_recalibrated", "iSDA_recalibrated"]
+    counts = frame.AEZ_name.value_counts()
+    rng = np.random.default_rng(settings["zone_seed"])
+    rows = []
+    for zone in counts[counts >= settings["zone_min_n"]].index:
+        group = frame.loc[frame.AEZ_name.eq(zone)]
+        soc, point = group.OC.to_numpy(), group.ours.to_numpy()
+        other_values = {name: group[name].to_numpy() for name in products}
+        values = np.full((settings["replicates"], len(products), len(names)), np.nan)
+        for start in range(0, settings["replicates"], settings["chunk"]):
+            size = min(settings["chunk"], settings["replicates"] - start)
+            draws = rng.integers(0, len(group), size=(size, len(group)))
+            for j, index in enumerate(draws):
+                ours = metrics(soc[index], point[index])
+                for p, product in enumerate(products):
+                    other = metrics(soc[index], other_values[product][index])
+                    for k, name in enumerate(names):
+                        if ours[name] is not None and other[name] is not None:
+                            values[start + j, p, k] = ours[name] - other[name]
+        baseline = metrics(soc, point)
+        for p, product in enumerate(products):
+            other = metrics(soc, other_values[product])
+            for k, name in enumerate(names):
+                distribution = values[:, p, k]
+                distribution = distribution[np.isfinite(distribution)]
+                rows.append(
+                    dict(
+                        zone=zone,
+                        AEZ=int(group.AEZ.iloc[0]),
+                        comparison="ours minus " + product,
+                        metric=name,
+                        estimate=baseline[name] - other[name]
+                        if baseline[name] is not None and other[name] is not None
+                        else None,
+                        lo_95=float(np.percentile(distribution, 2.5))
+                        if len(distribution)
+                        else None,
+                        hi_95=float(np.percentile(distribution, 97.5))
+                        if len(distribution)
+                        else None,
+                        n=len(group),
+                        replicates=settings["replicates"],
+                        valid_replicates=len(distribution),
+                        seed=settings["zone_seed"],
+                        unit="Paired points within AEZ; fixed fitted models and working recalibration coefficients; spatial dependence not resampled",
+                    )
+                )
+        print("Zone point bootstrap:", zone, "n =", len(group), flush=True)
+    columns = [
+        "zone",
+        "AEZ",
+        "comparison",
+        "metric",
+        "estimate",
+        "lo_95",
+        "hi_95",
+        "n",
+        "replicates",
+        "valid_replicates",
+        "seed",
+        "unit",
+    ]
+    save_csv(
+        output / "zone_paired_point_bootstrap.csv", pd.DataFrame(rows, columns=columns)
+    )
+
+
 def benchmark_products(data, final, output):
+    path = relative_path(CONFIG["product_points"])
+    if not path.is_file():
+        print(
+            "Product benchmarking skipped; missing product CSV: " + str(path),
+            flush=True,
+        )
+        return
     data = product_values(data)
     training = data.loc[~data.holdout].copy()
     evaluate = data.loc[data.holdout].copy()
@@ -2622,6 +2886,7 @@ def benchmark_products(data, final, output):
         ),
     )
     product_bootstrap(common, output)
+    zone_product_bootstrap(common, output)
     print(
         pd.DataFrame(records)
         .loc[lambda frame: frame.zone.eq("national")]
@@ -2634,8 +2899,6 @@ def benchmark_products(data, final, output):
 def main():
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     data, composition = load_analysis_table()
-    validate_raster_grid()
-    product_values(data)
     output = relative_path(CONFIG["output_dir"])
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(

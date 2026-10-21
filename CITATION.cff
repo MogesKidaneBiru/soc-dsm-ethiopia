@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the associated article."
+title: "Code for: Reliable national soil carbon maps require calibrated uncertainty and applicability"
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/[username]/soc-dsm-ethiopia"
+authors:
+  - family-names: Biru
+    given-names: Moges Kidane
+    affiliation: "University of Florida"
+    orcid: "https://orcid.org/0009-0000-6418-0045"
+  - family-names: Pavan
+    given-names: Willingthon
+    affiliation: "University of Florida"
+  - family-names: Biratu
+    given-names: Gizachew K.
+    affiliation: "International Maize and Wheat Improvement Center (CIMMYT)"
+  - family-names: Sida
+    given-names: Tesfaye S.
+    affiliation: "International Maize and Wheat Improvement Center (CIMMYT)"
+  - family-names: Nunes
+    given-names: Marcio R.
+    affiliation: "University of Florida"
+keywords:
+  - digital soil mapping
+  - soil organic carbon
+  - spatial cross-validation
+  - conformal prediction
+  - area of applicability

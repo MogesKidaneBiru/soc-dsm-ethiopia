@@ -6,7 +6,7 @@ The pipeline expects one table, `data/analysis_table.csv`, with one row per samp
 
 | Column | Description |
 |---|---|
-| `soc` | Soil organic carbon (% OC, 0–20 cm) |
+| `soc` | Soil organic carbon (% OC, 0-20 cm) |
 | `x`, `y` | Projected coordinates (EPSG:32637, m) |
 | `aez` | Agro-ecological zone code |
 | covariates | The 53 environmental covariates listed in Supplementary Table S1 of the article |

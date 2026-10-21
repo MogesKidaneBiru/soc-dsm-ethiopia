@@ -27,3 +27,20 @@ keywords:
   - spatial cross-validation
   - conformal prediction
   - area of applicability
+preferred-citation:
+  type: article
+  title: "Reliable national soil carbon maps require calibrated uncertainty and applicability"
+  journal: "Computers and Electronics in Agriculture"
+  status: submitted
+  authors:
+    - family-names: Biru
+      given-names: Moges Kidane
+      orcid: "https://orcid.org/0009-0000-6418-0045"
+    - family-names: Pavan
+      given-names: Willingthon
+    - family-names: Biratu
+      given-names: Gizachew K.
+    - family-names: Sida
+      given-names: Tesfaye S.
+    - family-names: Nunes
+      given-names: Marcio R.
